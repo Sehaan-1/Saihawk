@@ -103,6 +103,38 @@ class HuggingFaceModel(AIModel):
         print(response,type(response))
         return response
 
+
+class NvidiaModel(AIModel):
+    """
+    NVIDIA NIM inference platform via build.nvidia.com.
+    Uses langchain_nvidia_ai_endpoints.ChatNVIDIA.
+
+    Supported models (examples):
+        moonshotai/kimi-k2.6
+        meta/llama-3.1-405b-instruct
+        mistralai/mixtral-8x7b-instruct-v0.1
+
+    Set in .env:
+        NVIDIA_API_KEY=nvapi-...
+        NVIDIA_MODEL=moonshotai/kimi-k2.6   (or override via llm_model)
+    """
+
+    def __init__(self, api_key: str, llm_model: str):
+        from langchain_nvidia_ai_endpoints import ChatNVIDIA
+        self.model = ChatNVIDIA(
+            model=llm_model,
+            api_key=api_key,
+            temperature=1,
+            top_p=1,
+            max_completion_tokens=16384,
+        )
+        logger.debug(f"NvidiaModel initialised — model={llm_model}")
+
+    def invoke(self, prompt: str) -> BaseMessage:
+        logger.debug("Invoking NVIDIA NIM API")
+        response = self.model.invoke(prompt)
+        return response
+
 class AIAdapter:
     def __init__(self, config: dict, api_key: str):
         self.model = self._create_model(config, api_key)
@@ -124,7 +156,9 @@ class AIAdapter:
         elif llm_model_type == "gemini":
             return GeminiModel(api_key, llm_model)
         elif llm_model_type == "huggingface":
-            return HuggingFaceModel(api_key, llm_model)        
+            return HuggingFaceModel(api_key, llm_model)
+        elif llm_model_type == "nvidia":
+            return NvidiaModel(api_key, llm_model)
         else:
             raise ValueError(f"Unsupported model type: {llm_model_type}")
 
@@ -186,63 +220,58 @@ class LLMLogger:
             logger.error(f"Error obtaining current time: {str(e)}")
             raise
 
-        try:
-            token_usage = parsed_reply["usage_metadata"]
-            output_tokens = token_usage["output_tokens"]
-            input_tokens = token_usage["input_tokens"]
-            total_tokens = token_usage["total_tokens"]
-            logger.debug(f"Token usage - Input: {input_tokens}, Output: {output_tokens}, Total: {total_tokens}")
-        except KeyError as e:
-            logger.error(f"KeyError in parsed_reply structure: {str(e)}")
-            raise
+        # --- Token usage (safe extraction — different providers use different keys) ---
+        token_usage = parsed_reply.get("usage_metadata", {})
+        input_tokens  = token_usage.get("input_tokens", 0)
+        output_tokens = token_usage.get("output_tokens", 0)
+        total_tokens  = token_usage.get("total_tokens", input_tokens + output_tokens)
+        logger.debug(
+            f"Token usage — Input: {input_tokens}, Output: {output_tokens}, "
+            f"Total: {total_tokens}"
+        )
 
-        try:
-            model_name = parsed_reply["response_metadata"]["model_name"]
-            logger.debug(f"Model name: {model_name}")
-        except KeyError as e:
-            logger.error(f"KeyError in response_metadata: {str(e)}")
-            raise
+        # --- Model name (NVIDIA: 'model', OpenAI: 'model_name', others vary) ---
+        resp_meta   = parsed_reply.get("response_metadata", {})
+        model_name  = (
+            resp_meta.get("model_name")
+            or resp_meta.get("model")
+            or resp_meta.get("model_id")
+            or "unknown"
+        )
+        logger.debug(f"Model name: {model_name}")
 
-        try:
-            prompt_price_per_token = 0.00000015
-            completion_price_per_token = 0.0000006
-            total_cost = (input_tokens * prompt_price_per_token) + \
-                (output_tokens * completion_price_per_token)
-            logger.debug(f"Total cost calculated: {total_cost}")
-        except Exception as e:
-            logger.error(f"Error calculating total cost: {str(e)}")
-            raise
+        prompt_price_per_token     = 0.00000015
+        completion_price_per_token = 0.0000006
+        total_cost = (
+            (input_tokens  * prompt_price_per_token) +
+            (output_tokens * completion_price_per_token)
+        )
+        logger.debug(f"Total cost calculated: {total_cost}")
 
-        try:
-            log_entry = {
-                "model": model_name,
-                "time": current_time,
-                "prompts": prompts,
-                "replies": parsed_reply["content"],
-                "total_tokens": total_tokens,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_cost": total_cost,
-            }
-            logger.debug(f"Log entry created: {log_entry}")
-        except KeyError as e:
-            logger.error(f"Error creating log entry: missing key {str(e)} in parsed_reply")
-            raise
+        log_entry = {
+            "model"        : model_name,
+            "time"         : current_time,
+            "prompts"      : prompts,
+            "replies"      : parsed_reply.get("content", ""),
+            "total_tokens" : total_tokens,
+            "input_tokens" : input_tokens,
+            "output_tokens": output_tokens,
+            "total_cost"   : total_cost,
+        }
+        logger.debug(f"Log entry created: {log_entry}")
 
+        # --- Write log — non-fatal: a log failure must never crash the pipeline ---
         try:
             with open(calls_log, "a", encoding="utf-8") as f:
-                json_string = json.dumps(
-                    log_entry, ensure_ascii=False, indent=4)
-                f.write(json_string + "\n")
-                logger.debug(f"Log entry written to file: {calls_log}")
+                f.write(json.dumps(log_entry, ensure_ascii=False, indent=4) + "\n")
+            logger.debug(f"Log entry written to file: {calls_log}")
         except Exception as e:
-            logger.error(f"Error writing log entry to file: {str(e)}")
-            raise
+            logger.warning(f"[LLMLogger] Could not write log entry (non-fatal): {e}")
 
 
 class LoggerChatModel:
 
-    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel]):
+    def __init__(self, llm: Union[OpenAIModel, OllamaModel, ClaudeModel, GeminiModel, NvidiaModel]):
         self.llm = llm
         logger.debug(f"LoggerChatModel successfully initialized with LLM: {llm}")
 
@@ -297,61 +326,78 @@ class LoggerChatModel:
                 continue
 
     def parse_llmresult(self, llmresult: AIMessage) -> Dict[str, Dict]:
+        """
+        Parse an AIMessage into a normalised dict regardless of provider.
+
+        Works across: OpenAI, Anthropic, Gemini, Ollama, NVIDIA NIM,
+        HuggingFace — each returns slightly different metadata shapes.
+        This method never raises; missing fields fall back to safe defaults.
+        """
         logger.debug(f"Parsing LLM result: {llmresult}")
 
-        try:
-            if hasattr(llmresult, 'usage_metadata'):
-                content = llmresult.content
-                response_metadata = llmresult.response_metadata
-                id_ = llmresult.id
-                usage_metadata = llmresult.usage_metadata
+        content           = getattr(llmresult, "content", str(llmresult))
+        id_               = getattr(llmresult, "id", None)
+        response_metadata = getattr(llmresult, "response_metadata", {}) or {}
+        raw_usage         = getattr(llmresult, "usage_metadata", None)
 
-                parsed_result = {
-                    "content": content,
-                    "response_metadata": {
-                        "model_name": response_metadata.get("model_name", ""),
-                        "system_fingerprint": response_metadata.get("system_fingerprint", ""),
-                        "finish_reason": response_metadata.get("finish_reason", ""),
-                        "logprobs": response_metadata.get("logprobs", None),
-                    },
-                    "id": id_,
-                    "usage_metadata": {
-                        "input_tokens": usage_metadata.get("input_tokens", 0),
-                        "output_tokens": usage_metadata.get("output_tokens", 0),
-                        "total_tokens": usage_metadata.get("total_tokens", 0),
-                    },
-                }
-            else :  
-                content = llmresult.content
-                response_metadata = llmresult.response_metadata
-                id_ = llmresult.id
-                token_usage = response_metadata['token_usage']
+        # --- Normalise usage tokens ---
+        # langchain-core 1.x: usage_metadata is a TypedDict-like object or dict
+        # Older providers: token counts live inside response_metadata["token_usage"]
+        if raw_usage is not None:
+            # Modern path (langchain-core >= 0.3)
+            if isinstance(raw_usage, dict):
+                input_tokens  = raw_usage.get("input_tokens", 0)
+                output_tokens = raw_usage.get("output_tokens", 0)
+                total_tokens  = raw_usage.get(
+                    "total_tokens", input_tokens + output_tokens
+                )
+            else:
+                # Pydantic model or NamedTuple
+                input_tokens  = getattr(raw_usage, "input_tokens",  0)
+                output_tokens = getattr(raw_usage, "output_tokens", 0)
+                total_tokens  = getattr(
+                    raw_usage, "total_tokens", input_tokens + output_tokens
+                )
+        else:
+            # Legacy path: token_usage inside response_metadata
+            token_usage   = response_metadata.get("token_usage", {})
+            if hasattr(token_usage, "prompt_tokens"):
+                input_tokens  = token_usage.prompt_tokens
+                output_tokens = token_usage.completion_tokens
+                total_tokens  = token_usage.total_tokens
+            else:
+                input_tokens  = token_usage.get("prompt_tokens", 0)
+                output_tokens = token_usage.get("completion_tokens", 0)
+                total_tokens  = token_usage.get(
+                    "total_tokens", input_tokens + output_tokens
+                )
 
-                parsed_result = {
-                    "content": content,
-                    "response_metadata": {
-                        "model_name": response_metadata.get("model", ""),
-                        "finish_reason": response_metadata.get("finish_reason", ""),
-                    },
-                    "id": id_,
-                    "usage_metadata": {
-                        "input_tokens": token_usage.prompt_tokens,
-                        "output_tokens": token_usage.completion_tokens,
-                        "total_tokens": token_usage.total_tokens,
-                    },
-                }                  
-            logger.debug(f"Parsed LLM result successfully: {parsed_result}")
-            return parsed_result
+        # --- Normalise model name (each provider uses a different key) ---
+        model_name = (
+            response_metadata.get("model_name")    # OpenAI, Anthropic
+            or response_metadata.get("model")       # NVIDIA NIM, Gemini
+            or response_metadata.get("model_id")    # some HuggingFace endpoints
+            or "unknown"
+        )
 
-        except KeyError as e:
-            logger.error(
-                f"KeyError while parsing LLM result: missing key {str(e)}")
-            raise
+        parsed_result = {
+            "content": content,
+            "response_metadata": {
+                "model_name"        : model_name,
+                "system_fingerprint": response_metadata.get("system_fingerprint", ""),
+                "finish_reason"     : response_metadata.get("finish_reason", ""),
+                "logprobs"          : response_metadata.get("logprobs", None),
+            },
+            "id": id_,
+            "usage_metadata": {
+                "input_tokens" : input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens" : total_tokens,
+            },
+        }
 
-        except Exception as e:
-            logger.error(
-                f"Unexpected error while parsing LLM result: {str(e)}")
-            raise
+        logger.debug(f"Parsed LLM result successfully: {parsed_result}")
+        return parsed_result
 
 
 class GPTAnswerer:
